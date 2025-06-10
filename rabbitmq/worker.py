@@ -1,59 +1,94 @@
-import pika
+import sys
 import json
-import joblib
-import pandas as pd
 import time
-from sqlalchemy.orm import Session
-from datetime import datetime
-from app import models
-from app.database import get_db, engine
-from app.main import get_current_features1
+import requests
+import threading
+import os
+import pika
+import joblib 
+from get_data import get_current_features1
+from datetime import timedelta, datetime
+from database import engine, get_db
+from sqlalchemy import Column, Integer, String, Float, DateTime
 
-print("[*] ML worker started")
+exchange_name = 'ml_tasks'
+queue_name = 'test'
 
-# Load model once
-model = joblib.load('catboost_lr 0.38121, mae 0.1857300913901133 , mape 0.009344126631801567, rmse 0.10354896606489733.joblib')
+credentials = pika.PlainCredentials('rmuser', 'rmpassword')
+parameters = pika.ConnectionParameters(host='rabbitmq',
+                                        port=5672,
+                                        virtual_host='/',
+                                        credentials=credentials,
+                                        heartbeat=30,
+                                        blocked_connection_timeout=2)
 
-def handle_task(ch, method, properties, body):
+def callback(ch, method, properties, body):
     try:
-        print("[x] Task received")
-        features = get_current_features1()
+        print(f"Получено сообщение с delivery_tag: {method.delivery_tag}") 
 
-        if features.empty or features.isna().all().all():
-            print("[!] Features are empty or invalid")
-            return
+       
+        class Prediction(Base):
+            __tablename__ = "predictions"
 
-        prediction = model.predict(features)[0]
-        db = next(get_db())
+            id = Column(Integer, primary_key=True, index=True)
+            value = Column(Float)
+            timestamp = Column(DateTime, default=datetime.utcnow) 
+        
+        try:
 
-        new_prediction = models.Prediction(
-            value=float(prediction),
-            timestamp=datetime.utcnow()
-        )
-        db.add(new_prediction)
-        db.commit()
-        print(f"[✓] Prediction saved: {prediction}")
+            ml_model = joblib.load("catboost_lr 0.38121, mae 0.1857300913901133 , mape 0.009344126631801567, rmse 0.10354896606489733.joblib")
+            features = get_current_features1()
+            
+            if not features.empty and not features.isna().all().all():
+                prediction = ml_model.predict(features)[0]
+                current_time = datetime.utcnow()
+                
+                
+                db = next(get_db())
+                new_prediction = Prediction(
+                    value=float(prediction),
+                    timestamp=current_time
+                )
+                db.add(new_prediction)
+                db.commit()
+                
+            
+                
+            
+
+        except requests.exceptions.RequestException as e:
+            print(f"Ошибка при вызове ML сервиса: {e}")
+            
+            return 
     except Exception as e:
-        print(f"[!] Error: {e}")
+        print(f"Ошибка при обработке задачи: {e}")
+       
+def process_ml_task():
+    try:
+        
+        print("Подключаемся к RabbitMQ...")
+        connection = pika.BlockingConnection(parameters)
+        print("Подключение успешно")
+        channel = connection.channel()
 
-def start_worker():
-    credentials = pika.PlainCredentials("rmuser", "rmpassword")
-    parameters = pika.ConnectionParameters(
-        host="rabbitmq",
-        port=5672,
-        virtual_host="/",
-        credentials=credentials,
-        heartbeat=30,
-        blocked_connection_timeout=5
-    )
-    connection = pika.BlockingConnection(parameters)
-    channel = connection.channel()
-    channel.queue_declare(queue="ml_tasks", durable=True)
-    channel.basic_qos(prefetch_count=1)
-    channel.basic_consume(queue="ml_tasks", on_message_callback=handle_task, auto_ack=True)
+        channel.queue_declare(queue=queue_name)
 
-    print("[*] Waiting for ML tasks. To exit press CTRL+C")
-    channel.start_consuming()
+        channel.basic_consume(
+            queue=queue_name,
+            on_message_callback=callback,
+            auto_ack=True
+        )
 
-if __name__ == "__main__":
-    start_worker()
+        print(f" [*] Воркер {threading.current_thread().name} ожидает задач. Для выхода нажмите CTRL+C")
+        channel.start_consuming()
+
+    except Exception as e:
+        print(f"Ошибка в process_ml_task: {e}", file=sys.stderr)
+
+if __name__ == '__main__':
+    try:
+        print('Запускаемся')
+        process_ml_task()
+    except Exception as e:
+        print(f"Необработанное исключение в main: {e}", file=sys.stderr)
+        sys.exit(1)

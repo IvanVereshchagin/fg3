@@ -1,7 +1,8 @@
-import pika
-import json
+
 
 def send_prediction_task():
+    import pika
+    import json
     task = {"task": "predict"}  
     credentials = pika.PlainCredentials("rmuser", "rmpassword")
     parameters = pika.ConnectionParameters(
